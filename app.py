@@ -301,18 +301,21 @@ def extract_subtitle(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "writeautomaticsub": True,    # 자동 생성 자막 다운로드
-        "subtitleslangs": ["ko", "en"], # 한국어 수동/자동 없을 시 영어라도 시도
-        "subtitlesformat": "vtt",     # VTT 포맷 (파싱하기 용이)
+        "writeautomaticsub": True,
+        "subtitleslangs": ["ko", "en"],
+        "subtitlesformat": "vtt",
         "outtmpl": os.path.join(tmp_dir, "%(id)s"),
         "writesubtitles": True,
         
-        # ── 429 에러 우회(Anti-bot) 옵션 ──
-        "sleep_interval": 1,           # 요청 간 1초 대기
-        "max_sleep_interval": 3,
-        "extractor_retries": 3,        # 실패 시 최대 3번 재시도
+        # ── 429 에러 100% 우회(Anti-bot) 강력 옵션 ──
+        "sleep_interval": 3,           # 요청 간 3초 대기 (안전 속도)
+        "max_sleep_interval": 5,       # 최대 5초 랜덤 대기
+        "sleep_requests": 2,           # API 요청 사이에도 2초 대기
+        "impersonate": "chrome",       # 브라우저 지문 완벽 모방 (yt-dlp 최신 우회기법)
+        "extractor_retries": 5,        # 실패 시 최대 5회 재시도 (재시도 시 자동으로 백오프됨)
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
         },
     }
@@ -756,7 +759,7 @@ def main() -> None:
 
             st.markdown("---")
 
-            # ── 2단계: 자막 추출 & 처리 (병렬 처리) ──
+            # ── 2단계: 자막 추출 & 처리 (순차 처리로 롤백 및 안전 대기) ──
             progress_bar = st.progress(0, text="준비 중...")
             status_area = st.empty()
             total = len(entries)
@@ -764,60 +767,41 @@ def main() -> None:
             fail_count = 0
             failed_list = []
             
-            # 429 Too Many Requests (봇 차단) 방지를 위해 멀티스레드 대폭 제한
-            # 네트워크 상태에 따라 2~4 사이가 안전함
-            MAX_WORKERS = 3 
-            
-            # 진행 상태 공유 변수
-            processed_count = 0
-            
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                # 퓨처 매핑: future 객체 -> 해당 영상 entry 딕셔너리
-                future_to_entry = {
-                    executor.submit(process_single_video, entry, output_dir, subtitle_tmp_dir): entry
-                    for entry in entries
-                }
-                
-                for future in as_completed(future_to_entry):
-                    # 정지 버튼 확인
-                    if st.session_state.get("stop_requested", False):
-                        st.warning("사용자에 의해 작업이 중단되었습니다. 진행 중인 요청을 취소하고 지금까지 추출된 파일만 저장합니다.")
-                        # 대기 중인 작업 취소
-                        for f in future_to_entry.keys():
-                            f.cancel()
-                        break
-                        
-                    entry = future_to_entry[future]
-                    processed_count += 1
-                    progress = processed_count / total
-                    
-                    try:
-                        result = future.result()
-                        if result["success"]:
-                            success_count += 1
-                        else:
-                            fail_count += 1
-                            failed_list.append(result)
-                    except Exception as e:
-                        fail_count += 1
-                        failed_list.append({"success": False, "title": entry["title"], "error": f"치명적 오류: {e}"})
+            for i, entry in enumerate(entries):
+                # 정지 버튼 확인
+                if st.session_state.get("stop_requested", False):
+                    st.warning("사용자에 의해 작업이 중단되었습니다. 지금까지 추출된 파일만 저장합니다.")
+                    break
 
-                    # 진행률 UI 업데이트
-                    progress_bar.progress(
-                        progress,
-                        text=f"처리 중 ({processed_count}/{total})",
-                    )
-                    status_area.markdown(f"""
-                    <div class="status-card">
-                        <div class="label">최근 처리 완료 ({processed_count}번째)</div>
-                        <div class="value">{entry['title']}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                current = i + 1
+                progress = current / total
+                title = entry["title"]
+
+                # 진행률 UI 업데이트
+                progress_bar.progress(
+                    progress,
+                    text=f"처리 중 ({current}/{total})",
+                )
+                status_area.markdown(f"""
+                <div class="status-card">
+                    <div class="label">현재 처리 중</div>
+                    <div class="value">{title}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # 개별 영상 처리 (Fault Tolerance 적용)
+                result = process_single_video(entry, output_dir, subtitle_tmp_dir)
+
+                if result["success"]:
+                    success_count += 1
+                else:
+                    fail_count += 1
+                    failed_list.append(result)
 
             # 진행률 완료/중단 표시
             is_stopped = st.session_state.get("stop_requested", False)
             if is_stopped:
-                progress_bar.progress(progress, text=f"⏹ 중단됨 ({processed_count}/{total})")
+                progress_bar.progress(progress, text=f"⏹ 중단됨 ({current}/{total})")
             else:
                 progress_bar.progress(1.0, text="✅ 모든 영상 처리 완료!")
                 
