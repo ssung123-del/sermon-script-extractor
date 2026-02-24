@@ -20,6 +20,12 @@ from typing import Optional
 
 import streamlit as st
 import yt_dlp
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    NoTranscriptFound,
+    TranscriptsDisabled,
+    VideoUnavailable,
+)
 
 # ──────────────────────────────────────────────
 # 로깅 설정
@@ -284,124 +290,39 @@ def get_playlist_entries(url: str) -> list[dict]:
     return entries
 
 
-def _attempt_subtitle_download(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
+def extract_subtitle(video_id: str) -> Optional[str]:
     """
-    yt-dlp를 이용해 개별 영상의 자막을 1회 시도한다.
-    
-    왜: 이 함수를 분리하여, 상위 함수(extract_subtitle)에서
-    429 에러 발생 시 지수적 백오프(Exponential Backoff)로
-    재시도하는 구조를 만들기 위함.
-    """
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": ["ko", "en"],
-        "subtitlesformat": "vtt",
-        "outtmpl": os.path.join(tmp_dir, "%(id)s"),
-        "writesubtitles": True,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        },
-    }
+    youtube-transcript-api를 사용하여 개별 영상의 자막 텍스트를 추출한다.
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-        if info is None:
-            return None, "00000000"
-
-        video_id = info.get("id", "unknown")
-        upload_date = info.get("upload_date", "00000000")
-
-        # 자막 다운로드 실행
-        ydl.download([video_url])
-
-    # 다운로드된 자막 파일 탐색 (한국어 우선, 이후 영어)
-    subtitle_path = None
-    for suffix in [f"{video_id}.ko.vtt", f"{video_id}.en.vtt"]:
-        candidate = os.path.join(tmp_dir, suffix)
-        if os.path.exists(candidate):
-            subtitle_path = candidate
-            break
-
-    # 글로벌 패턴 검색 (자동 자막 파일명이 다를 수 있음)
-    if subtitle_path is None:
-        for f in os.listdir(tmp_dir):
-            if video_id in f and f.endswith(".vtt"):
-                subtitle_path = os.path.join(tmp_dir, f)
-                break
-
-    if subtitle_path is None:
-        logger.warning(f"자막 파일을 찾을 수 없음: {video_id}")
-        return None, upload_date
-
-    with open(subtitle_path, "r", encoding="utf-8") as f:
-        raw_text = f.read()
-
-    os.remove(subtitle_path)
-    return raw_text, upload_date
-
-
-def extract_subtitle(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
-    """
-    개별 영상에서 자막을 추출한다. 429 에러 시 지수적 백오프로 재시도.
-
-    왜: 유튜브 자막 API(/api/timedtext)는 단시간 다량 요청 시
-    HTTP 429(Too Many Requests)를 반환한다. yt-dlp 내부 옵션만으로는
-    이 자막 API 요청의 속도를 제어할 수 없으므로, 외부에서 직접
-    재시도 + 대기 로직을 감싸는 것이 근본적 해결책이다.
-
-    재시도 전략 (Exponential Backoff):
-        1회차 실패 → 30초 대기 후 재시도
-        2회차 실패 → 60초 대기 후 재시도
-        3회차 실패 → 120초 대기 후 재시도
-        4회차 실패 → 240초 대기 후 재시도
-        5회차 실패 → 최종 포기
+    왜: yt-dlp는 영상 전체 페이지를 파싱하여 자막을 가져오는 무거운 방식이라
+    클라우드 환경에서 HTTP 429 차단이 빈번했다.
+    youtube-transcript-api는 자막 전용 API를 직접 호출하는 경량 라이브러리로,
+    요청이 훨씬 가볍고 빠르며 차단 위험이 낮다.
 
     Args:
-        video_url: 유튜브 영상 URL
-        tmp_dir: 자막 파일 임시 저장 디렉토리
+        video_id: 유튜브 영상 ID (예: 'dQw4w9WgXcQ')
 
     Returns:
-        (추출된 자막 원문 또는 None, 업로드 날짜 문자열)
+        추출된 자막 텍스트 또는 None (자막 없는 경우)
     """
-    MAX_RETRIES = 5
-    BASE_WAIT = 30  # 첫 번째 대기 시간 (초)
+    try:
+        api = YouTubeTranscriptApi()
+        # 한국어 자막 우선, 없으면 영어 자막 fallback
+        transcript = api.fetch(video_id, languages=["ko", "en"])
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            result = _attempt_subtitle_download(video_url, tmp_dir)
-            return result  # 성공 시 즉시 반환
+        # 자막 스니펫들을 단일 텍스트로 병합
+        text_parts = [snippet.text for snippet in transcript.snippets]
+        return " ".join(text_parts)
 
-        except Exception as e:
-            error_msg = str(e)
-            is_429 = "429" in error_msg or "Too Many Requests" in error_msg
-
-            if is_429 and attempt < MAX_RETRIES - 1:
-                # 지수적 백오프: 30초 → 60초 → 120초 → 240초
-                wait_time = BASE_WAIT * (2 ** attempt)
-                # 랜덤 지터(Jitter) 추가하여 동시다발적 재시도 방지
-                jitter = random.uniform(0, wait_time * 0.2)
-                total_wait = wait_time + jitter
-                
-                logger.warning(
-                    f"429 에러 발생. {total_wait:.0f}초 대기 후 재시도 "
-                    f"({attempt + 1}/{MAX_RETRIES}): {video_url}"
-                )
-                time.sleep(total_wait)
-            elif is_429:
-                # 최대 재시도 횟수 초과
-                logger.error(f"429 에러 최대 재시도 초과: {video_url}")
-                return None, "00000000"
-            else:
-                # 429가 아닌 다른 에러는 바로 실패 처리
-                logger.error(f"자막 추출 실패 ({error_msg}): {video_url}")
-                return None, "00000000"
-
-    return None, "00000000"
+    except (NoTranscriptFound, TranscriptsDisabled):
+        logger.warning(f"자막 없음 또는 비활성화됨: {video_id}")
+        return None
+    except VideoUnavailable:
+        logger.warning(f"영상 접근 불가: {video_id}")
+        return None
+    except Exception as e:
+        logger.error(f"자막 추출 실패 [{video_id}]: {e}")
+        return None
 
 
 def parse_vtt_lines(vtt_content: str) -> list[str]:
@@ -615,13 +536,11 @@ def process_single_video(
         dict: {success: bool, title: str, error: str|None}
     """
     title = entry["title"]
-    video_url = entry["url"]
+    video_id = entry["id"]
 
     try:
-        # 1단계: 자막 추출
-        extract_result = extract_subtitle(video_url, subtitle_tmp_dir)
-        raw_subtitle = extract_result[0]
-        upload_date = extract_result[1]
+        # 1단계: 자막 추출 (youtube-transcript-api 사용 — 가볍고 빠름)
+        raw_subtitle = extract_subtitle(video_id)
         
         if raw_subtitle is None:
             return {
@@ -630,20 +549,8 @@ def process_single_video(
                 "error": "자막 없음 (자동 자막 미생성 또는 비공개)",
             }
 
-        # 2단계: VTT에서 텍스트 라인만 파싱
-        text_lines = parse_vtt_lines(raw_subtitle)
-        if not text_lines:
-            return {
-                "success": False,
-                "title": title,
-                "error": "자막 텍스트가 비어 있음",
-            }
-
-        # 3단계: 중복 제거
-        merged_text = remove_duplicate_lines(text_lines)
-
-        # 4단계: 클리닝
-        cleaned_text = clean_text(merged_text)
+        # 2단계: 클리닝 (이미 텍스트 형태로 받았으므로 VTT 파싱/중복제거 불필요)
+        cleaned_text = clean_text(raw_subtitle)
         if not cleaned_text.strip():
             return {
                 "success": False,
@@ -651,10 +558,10 @@ def process_single_video(
                 "error": "클리닝 후 텍스트가 비어 있음",
             }
 
-        # 5단계: 파일 저장
+        # 3단계: 파일 저장
         filename = build_filename(
             entry["index"],
-            upload_date,
+            entry.get("upload_date", "00000000"),
             title,
         )
         filepath = os.path.join(output_dir, filename)
