@@ -302,11 +302,19 @@ def extract_subtitle(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
         "no_warnings": True,
         "skip_download": True,
         "writeautomaticsub": True,    # 자동 생성 자막 다운로드
-        "subtitleslangs": ["ko"],     # 한국어 자막만
+        "subtitleslangs": ["ko", "en"], # 한국어 수동/자동 없을 시 영어라도 시도
         "subtitlesformat": "vtt",     # VTT 포맷 (파싱하기 용이)
         "outtmpl": os.path.join(tmp_dir, "%(id)s"),
-        # 수동 자막도 시도 (있으면 자동보다 품질이 좋음)
         "writesubtitles": True,
+        
+        # ── 429 에러 우회(Anti-bot) 옵션 ──
+        "sleep_interval": 1,           # 요청 간 1초 대기
+        "max_sleep_interval": 3,
+        "extractor_retries": 3,        # 실패 시 최대 3번 재시도
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -320,9 +328,15 @@ def extract_subtitle(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
         # 자막 다운로드 실행
         ydl.download([video_url])
 
-    # 다운로드된 자막 파일 탐색 (수동 자막 우선, 자동 자막 대체)
+    # 다운로드된 자막 파일 탐색 (한국어 우선, 이후 영어)
     subtitle_path = None
-    for suffix in [f"{video_id}.ko.vtt", f"{video_id}.ko.vtt"]:
+    candidates = [
+        f"{video_id}.ko.vtt",
+        f"{video_id}.en.vtt",
+        f"{video_id}.ko.vtt",
+    ]
+    
+    for suffix in candidates:
         candidate = os.path.join(tmp_dir, suffix)
         if os.path.exists(candidate):
             subtitle_path = candidate
@@ -750,8 +764,9 @@ def main() -> None:
             fail_count = 0
             failed_list = []
             
-            # 멀티스레드 워커 수 설정 (네트워크 I/O 바운드 작업이므로 5~10 적당)
-            MAX_WORKERS = 10 
+            # 429 Too Many Requests (봇 차단) 방지를 위해 멀티스레드 대폭 제한
+            # 네트워크 상태에 따라 2~4 사이가 안전함
+            MAX_WORKERS = 3 
             
             # 진행 상태 공유 변수
             processed_count = 0
