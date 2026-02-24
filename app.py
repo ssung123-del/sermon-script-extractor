@@ -311,7 +311,6 @@ def extract_subtitle(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
         "sleep_interval": 3,           # 요청 간 3초 대기 (안전 속도)
         "max_sleep_interval": 5,       # 최대 5초 랜덤 대기
         "sleep_requests": 2,           # API 요청 사이에도 2초 대기
-        "impersonate": "chrome",       # 브라우저 지문 완벽 모방 (yt-dlp 최신 우회기법)
         "extractor_retries": 5,        # 실패 시 최대 5회 재시도 (재시도 시 자동으로 백오프됨)
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
