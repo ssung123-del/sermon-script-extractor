@@ -9,11 +9,12 @@
 
 import logging
 import os
+import random
 import re
 import shutil
 import tempfile
+import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 
@@ -283,19 +284,13 @@ def get_playlist_entries(url: str) -> list[dict]:
     return entries
 
 
-def extract_subtitle(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
+def _attempt_subtitle_download(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
     """
-    개별 영상에서 한국어 자동 생성 자막 텍스트를 추출한다.
-
-    왜: yt-dlp의 자막 추출 기능을 활용하면 영상 다운로드 없이
-    자막 데이터만 빠르게 가져올 수 있다.
-
-    Args:
-        video_url: 유튜브 영상 URL
-        tmp_dir: 자막 파일 임시 저장 디렉토리
-
-    Returns:
-        (추출된 자막 원문 또는 None, 업로드 날짜 문자열)
+    yt-dlp를 이용해 개별 영상의 자막을 1회 시도한다.
+    
+    왜: 이 함수를 분리하여, 상위 함수(extract_subtitle)에서
+    429 에러 발생 시 지수적 백오프(Exponential Backoff)로
+    재시도하는 구조를 만들기 위함.
     """
     ydl_opts = {
         "quiet": True,
@@ -306,12 +301,6 @@ def extract_subtitle(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
         "subtitlesformat": "vtt",
         "outtmpl": os.path.join(tmp_dir, "%(id)s"),
         "writesubtitles": True,
-        
-        # ── 429 에러 100% 우회(Anti-bot) 강력 옵션 ──
-        "sleep_interval": 3,           # 요청 간 3초 대기 (안전 속도)
-        "max_sleep_interval": 5,       # 최대 5초 랜덤 대기
-        "sleep_requests": 2,           # API 요청 사이에도 2초 대기
-        "extractor_retries": 5,        # 실패 시 최대 5회 재시도 (재시도 시 자동으로 백오프됨)
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -332,19 +321,13 @@ def extract_subtitle(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
 
     # 다운로드된 자막 파일 탐색 (한국어 우선, 이후 영어)
     subtitle_path = None
-    candidates = [
-        f"{video_id}.ko.vtt",
-        f"{video_id}.en.vtt",
-        f"{video_id}.ko.vtt",
-    ]
-    
-    for suffix in candidates:
+    for suffix in [f"{video_id}.ko.vtt", f"{video_id}.en.vtt"]:
         candidate = os.path.join(tmp_dir, suffix)
         if os.path.exists(candidate):
             subtitle_path = candidate
             break
 
-    # 자동 자막 파일명 패턴도 확인
+    # 글로벌 패턴 검색 (자동 자막 파일명이 다를 수 있음)
     if subtitle_path is None:
         for f in os.listdir(tmp_dir):
             if video_id in f and f.endswith(".vtt"):
@@ -353,15 +336,72 @@ def extract_subtitle(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
 
     if subtitle_path is None:
         logger.warning(f"자막 파일을 찾을 수 없음: {video_id}")
-        return None
+        return None, upload_date
 
     with open(subtitle_path, "r", encoding="utf-8") as f:
         raw_text = f.read()
 
-    # 사용 후 자막 파일 즉시 삭제 (메모리 관리)
     os.remove(subtitle_path)
-
     return raw_text, upload_date
+
+
+def extract_subtitle(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
+    """
+    개별 영상에서 자막을 추출한다. 429 에러 시 지수적 백오프로 재시도.
+
+    왜: 유튜브 자막 API(/api/timedtext)는 단시간 다량 요청 시
+    HTTP 429(Too Many Requests)를 반환한다. yt-dlp 내부 옵션만으로는
+    이 자막 API 요청의 속도를 제어할 수 없으므로, 외부에서 직접
+    재시도 + 대기 로직을 감싸는 것이 근본적 해결책이다.
+
+    재시도 전략 (Exponential Backoff):
+        1회차 실패 → 30초 대기 후 재시도
+        2회차 실패 → 60초 대기 후 재시도
+        3회차 실패 → 120초 대기 후 재시도
+        4회차 실패 → 240초 대기 후 재시도
+        5회차 실패 → 최종 포기
+
+    Args:
+        video_url: 유튜브 영상 URL
+        tmp_dir: 자막 파일 임시 저장 디렉토리
+
+    Returns:
+        (추출된 자막 원문 또는 None, 업로드 날짜 문자열)
+    """
+    MAX_RETRIES = 5
+    BASE_WAIT = 30  # 첫 번째 대기 시간 (초)
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            result = _attempt_subtitle_download(video_url, tmp_dir)
+            return result  # 성공 시 즉시 반환
+
+        except Exception as e:
+            error_msg = str(e)
+            is_429 = "429" in error_msg or "Too Many Requests" in error_msg
+
+            if is_429 and attempt < MAX_RETRIES - 1:
+                # 지수적 백오프: 30초 → 60초 → 120초 → 240초
+                wait_time = BASE_WAIT * (2 ** attempt)
+                # 랜덤 지터(Jitter) 추가하여 동시다발적 재시도 방지
+                jitter = random.uniform(0, wait_time * 0.2)
+                total_wait = wait_time + jitter
+                
+                logger.warning(
+                    f"429 에러 발생. {total_wait:.0f}초 대기 후 재시도 "
+                    f"({attempt + 1}/{MAX_RETRIES}): {video_url}"
+                )
+                time.sleep(total_wait)
+            elif is_429:
+                # 최대 재시도 횟수 초과
+                logger.error(f"429 에러 최대 재시도 초과: {video_url}")
+                return None, "00000000"
+            else:
+                # 429가 아닌 다른 에러는 바로 실패 처리
+                logger.error(f"자막 추출 실패 ({error_msg}): {video_url}")
+                return None, "00000000"
+
+    return None, "00000000"
 
 
 def parse_vtt_lines(vtt_content: str) -> list[str]:
@@ -796,6 +836,12 @@ def main() -> None:
                 else:
                     fail_count += 1
                     failed_list.append(result)
+                
+                # ── 429 에러 근본 방지: 영상 사이 직접적 쿨다운 ──
+                # 왜: yt-dlp의 sleep_interval은 자막 API 요청에 적용되지 않으므로,
+                # 파이썬 코드에서 직접 time.sleep()을 호출해야 한다.
+                cooldown = random.uniform(3, 6)  # 3~6초 랜덤 대기
+                time.sleep(cooldown)
 
             # 진행률 완료/중단 표시
             is_stopped = st.session_state.get("stop_requested", False)
