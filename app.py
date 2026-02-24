@@ -133,6 +133,16 @@ def setup_page() -> None:
             box-shadow: 0 4px 16px rgba(35, 134, 54, 0.3) !important;
         }
 
+        /* ── 중단 버튼 (Stop) ── */
+        div[data-testid="stButton"] > button:has(+ div > div > span:contains("정지")) {
+            background: linear-gradient(135deg, #F85149, #DA3633) !important;
+            color: #FFFFFF !important;
+        }
+        div[data-testid="stButton"] > button:has(+ div > div > span:contains("정지")):hover {
+            background: linear-gradient(135deg, #FF6A69, #F85149) !important;
+            box-shadow: 0 4px 16px rgba(248, 81, 73, 0.3) !important;
+        }
+
         /* ── 진행 상태 영역 ── */
         .status-card {
             background-color: #161B22;
@@ -238,10 +248,9 @@ def get_playlist_entries(url: str) -> list[dict]:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": False,  # 개별 영상 메타데이터도 가져오기
-        "ignoreerrors": True,   # 비공개 영상 등 에러 무시
+        "extract_flat": "in_playlist",  # 재생목록 메타데이터만 초고속 추출
+        "ignoreerrors": True,           # 비공개 영상 등 에러 무시
         "skip_download": True,
-        # 자막이나 영상 없이 메타데이터만 추출
         "dump_single_json": True,
     }
 
@@ -274,7 +283,7 @@ def get_playlist_entries(url: str) -> list[dict]:
     return entries
 
 
-def extract_subtitle(video_url: str, tmp_dir: str) -> Optional[str]:
+def extract_subtitle(video_url: str, tmp_dir: str) -> tuple[Optional[str], str]:
     """
     개별 영상에서 한국어 자동 생성 자막 텍스트를 추출한다.
 
@@ -286,7 +295,7 @@ def extract_subtitle(video_url: str, tmp_dir: str) -> Optional[str]:
         tmp_dir: 자막 파일 임시 저장 디렉토리
 
     Returns:
-        추출된 자막 원문 문자열 또는 None (자막 없는 경우)
+        (추출된 자막 원문 또는 None, 업로드 날짜 문자열)
     """
     ydl_opts = {
         "quiet": True,
@@ -303,9 +312,10 @@ def extract_subtitle(video_url: str, tmp_dir: str) -> Optional[str]:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
         if info is None:
-            return None
+            return None, "00000000"
 
         video_id = info.get("id", "unknown")
+        upload_date = info.get("upload_date", "00000000")
 
         # 자막 다운로드 실행
         ydl.download([video_url])
@@ -335,7 +345,7 @@ def extract_subtitle(video_url: str, tmp_dir: str) -> Optional[str]:
     # 사용 후 자막 파일 즉시 삭제 (메모리 관리)
     os.remove(subtitle_path)
 
-    return raw_text
+    return raw_text, upload_date
 
 
 def parse_vtt_lines(vtt_content: str) -> list[str]:
@@ -553,7 +563,10 @@ def process_single_video(
 
     try:
         # 1단계: 자막 추출
-        raw_subtitle = extract_subtitle(video_url, subtitle_tmp_dir)
+        extract_result = extract_subtitle(video_url, subtitle_tmp_dir)
+        raw_subtitle = extract_result[0]
+        upload_date = extract_result[1]
+        
         if raw_subtitle is None:
             return {
                 "success": False,
@@ -585,7 +598,7 @@ def process_single_video(
         # 5단계: 파일 저장
         filename = build_filename(
             entry["index"],
-            entry["upload_date"],
+            upload_date,
             title,
         )
         filepath = os.path.join(output_dir, filename)
@@ -629,7 +642,24 @@ def render_input_section() -> tuple[str, bool]:
         placeholder="재생목록 또는 개별 영상 URL을 붙여넣으세요",
         label_visibility="collapsed",
     )
-    start = st.button("✦  추출 시작", use_container_width=True)
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        start = st.button("✦  추출 시작", use_container_width=True)
+    with col2:
+        st.markdown(
+            '<div style="font-size:0px"><span style="display:none">정지</span></div>',
+            unsafe_allow_html=True
+        )
+        stop = st.button("⏹ 정지", use_container_width=True, key="stop_btn")
+        
+        if stop:
+            st.session_state["stop_requested"] = True
+            
+    # 시작을 누르면 정지 상태 초기화
+    if start:
+        st.session_state["stop_requested"] = False
+
     return url, start
 
 
@@ -674,8 +704,8 @@ def main() -> None:
 
     전체 워크플로우:
         1. 사용자로부터 유튜브 URL 입력 받기
-        2. yt-dlp로 재생목록 메타데이터 추출
-        3. 각 영상의 자막 추출 → 클리닝 → 저장
+        2. yt-dlp로 재생목록 메타데이터 초고속 추출 (extract_flat)
+        3. 각 영상의 자막 추출 → 클리닝 → 저장 (ThreadPool 병렬 처리)
         4. ZIP 파일 생성 → 다운로드 버튼 제공
         5. 임시 파일 정리
     """
@@ -712,42 +742,70 @@ def main() -> None:
 
             st.markdown("---")
 
-            # ── 2단계: 자막 추출 & 처리 ──
+            # ── 2단계: 자막 추출 & 처리 (병렬 처리) ──
             progress_bar = st.progress(0, text="준비 중...")
             status_area = st.empty()
             total = len(entries)
             success_count = 0
             fail_count = 0
             failed_list = []
+            
+            # 멀티스레드 워커 수 설정 (네트워크 I/O 바운드 작업이므로 5~10 적당)
+            MAX_WORKERS = 10 
+            
+            # 진행 상태 공유 변수
+            processed_count = 0
+            
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # 퓨처 매핑: future 객체 -> 해당 영상 entry 딕셔너리
+                future_to_entry = {
+                    executor.submit(process_single_video, entry, output_dir, subtitle_tmp_dir): entry
+                    for entry in entries
+                }
+                
+                for future in as_completed(future_to_entry):
+                    # 정지 버튼 확인
+                    if st.session_state.get("stop_requested", False):
+                        st.warning("사용자에 의해 작업이 중단되었습니다. 진행 중인 요청을 취소하고 지금까지 추출된 파일만 저장합니다.")
+                        # 대기 중인 작업 취소
+                        for f in future_to_entry.keys():
+                            f.cancel()
+                        break
+                        
+                    entry = future_to_entry[future]
+                    processed_count += 1
+                    progress = processed_count / total
+                    
+                    try:
+                        result = future.result()
+                        if result["success"]:
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                            failed_list.append(result)
+                    except Exception as e:
+                        fail_count += 1
+                        failed_list.append({"success": False, "title": entry["title"], "error": f"치명적 오류: {e}"})
 
-            for i, entry in enumerate(entries):
-                current = i + 1
-                progress = current / total
-                title = entry["title"]
+                    # 진행률 UI 업데이트
+                    progress_bar.progress(
+                        progress,
+                        text=f"처리 중 ({processed_count}/{total})",
+                    )
+                    status_area.markdown(f"""
+                    <div class="status-card">
+                        <div class="label">최근 처리 완료 ({processed_count}번째)</div>
+                        <div class="value">{entry['title']}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-                # 진행률 UI 업데이트
-                progress_bar.progress(
-                    progress,
-                    text=f"처리 중 ({current}/{total})",
-                )
-                status_area.markdown(f"""
-                <div class="status-card">
-                    <div class="label">현재 처리 중</div>
-                    <div class="value">{title}</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # 개별 영상 처리 (Fault Tolerance 적용)
-                result = process_single_video(entry, output_dir, subtitle_tmp_dir)
-
-                if result["success"]:
-                    success_count += 1
-                else:
-                    fail_count += 1
-                    failed_list.append(result)
-
-            # 진행률 완료 표시
-            progress_bar.progress(1.0, text="✅ 모든 영상 처리 완료!")
+            # 진행률 완료/중단 표시
+            is_stopped = st.session_state.get("stop_requested", False)
+            if is_stopped:
+                progress_bar.progress(progress, text=f"⏹ 중단됨 ({processed_count}/{total})")
+            else:
+                progress_bar.progress(1.0, text="✅ 모든 영상 처리 완료!")
+                
             status_area.empty()
 
             st.markdown("---")
